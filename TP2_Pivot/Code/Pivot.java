@@ -8,100 +8,133 @@ import org.apache.hadoop.io.IntWritable;
 import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.WritableComparable;
+import org.apache.hadoop.io.WritableComparator;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Partitioner;
 import org.apache.hadoop.mapreduce.Reducer;
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 
-import static java.lang.Integer.parseInt;
 
 
 public class Pivot {
 
-    public static class RowElementPair implements WritableComparable<RowElementPair> {
-        private LongWritable row;
-        private Text element;
+    public static class ColRowPair implements WritableComparable<ColRowPair> {
 
-        public RowElementPair() {
-            set(new LongWritable(), new Text());
+        private IntWritable col; // natural key
+        private LongWritable row; // composite key
+
+        public ColRowPair() {
+            set(new IntWritable(), new LongWritable());
         }
-        public RowElementPair(Long row, String element) {
-            set(new LongWritable(row), new Text(element));
+        public ColRowPair(int col, Long row) {
+            set(new IntWritable(col), new LongWritable(row));
         }
-        private void set(LongWritable row, Text element) {
+        private void set(IntWritable col, LongWritable row) {
+            this.col = col;
             this.row = row;
-            this.element = element;
         }
-        public String getElementString() {
-            return element.toString();
+        public IntWritable getCol() {
+            return col;
+        }
+        public LongWritable getRow() {
+            return row;
         }
         @Override
         public void write(DataOutput out) throws IOException {
+            col.write(out);
             row.write(out);
-            element.write(out);
         }
         @Override
         public void readFields(DataInput in) throws IOException {
+            col.readFields(in);
             row.readFields(in);
-            element.readFields(in);
         }
-        @Override//!!!!!!!!!!!!!!!!!!!!!!!!!!!不确定hashCode要怎么写
+        @Override
         public int hashCode() {
-            return row.hashCode();// * 163 + element.hashCode();
+            return row.hashCode() * 163 + col.hashCode();
         }
         @Override
         public boolean equals(Object o) {
-            if (o instanceof RowElementPair) {
-                RowElementPair tp = (RowElementPair) o;
-                return row.equals(tp.row);
+            if (o instanceof ColRowPair) {
+                ColRowPair tp = (ColRowPair) o;
+                return col.equals(tp.col) && row.equals(tp.row);
             }
             return false;
         }
         @Override
-        public int compareTo(RowElementPair tp) {
-
-            return row.compareTo(tp.row);
+        public int compareTo(ColRowPair tp) {
+            int compareValue = this.col.compareTo(tp.getCol());
+            if (compareValue == 0) {
+                compareValue = this.row.compareTo(tp.getRow());
+            }
+            return compareValue;    // sort ascending
         }
     }
 
     public static class TokenizerMapper
-            extends Mapper<LongWritable, Text, IntWritable, RowElementPair>{
+            extends Mapper<LongWritable, Text, ColRowPair, Text>{
 
         //private IntWritable col = new IntWritable();
-        private RowElementPair word = new RowElementPair();
+        private ColRowPair colRow = new ColRowPair();
+        private Text element = new Text();
 
         public void map(LongWritable key, Text value, Context context
         ) throws IOException, InterruptedException {
             StringTokenizer itr = new StringTokenizer(value.toString(), ",");
-            IntWritable col = new IntWritable(0);
+            int coltp = 0;
             while (itr.hasMoreTokens()) {
-                col.set(col.get()+1);
-                word.set(key, new Text(itr.nextToken()));
-                context.write(col, word);
+                coltp++;
+                colRow.set(new IntWritable(coltp), key);
+                element = new Text(itr.nextToken());
+                context.write(colRow, element);
             }
         }
     }
 
+    public static class ColPartitioner
+            extends Partitioner<ColRowPair, Text> {
+
+        @Override
+        public int getPartition(ColRowPair pair,
+                                Text text,
+                                int numberOfPartitions) {
+            // make sure that partitions are non-negative
+            return Math.abs(pair.getCol().hashCode() % numberOfPartitions);
+
+        }
+    }
+
+    public static class ColGroupingComparator extends WritableComparator {
+        public ColGroupingComparator() {
+            super(ColRowPair.class,true);
+        }
+        @Override
+        public int compare(WritableComparable tp1, WritableComparable tp2) {
+            ColRowPair colrowPair = (ColRowPair) tp1;
+            ColRowPair colrowPair2 = (ColRowPair) tp2;
+            return colrowPair.getCol().compareTo(colrowPair2.getCol());
+        }
+    }
+
     public static class PivotReducer
-            extends Reducer<IntWritable, RowElementPair, IntWritable, Text> {
+            extends Reducer<ColRowPair, Text, IntWritable, Text> {
         private Text result = new Text();
 
-        public void reduce(IntWritable col, Iterable<RowElementPair> elements,
+        public void reduce(ColRowPair colRow, Iterable<Text> elements,
                            Context context
         ) throws IOException, InterruptedException {
             StringBuilder str = new StringBuilder("");
-            for (RowElementPair ele : elements) {
+            for (Text ele : elements) {
                 if(str.toString().equals("")){
-                    str.insert(0, ele.getElementString());
-                    //str.append(ele.getElementString());
+                    str.append(ele.toString());
                 } else {
-                    str.insert(0,",").insert(0,ele.getElementString());
-                    //str.append("，").append(ele.getElementString());
+                    str.append(",").append(ele.toString());
                 }
             }
             result.set(str.toString().trim());
-            context.write(col, result);
+            context.write(colRow.col, result);
         }
     }
 
@@ -110,10 +143,11 @@ public class Pivot {
         Job job = Job.getInstance(conf, "pivot");
         job.setJarByClass(Pivot.class);
         job.setMapperClass(TokenizerMapper.class);
-        //job.setCombinerClass(PivotReducer.class);
+        job.setPartitionerClass(ColPartitioner.class);
+        job.setGroupingComparatorClass(ColGroupingComparator.class);
         job.setReducerClass(PivotReducer.class);
-        job.setMapOutputKeyClass(IntWritable.class);
-        job.setMapOutputValueClass(RowElementPair.class);
+        job.setMapOutputKeyClass(ColRowPair.class);
+        job.setMapOutputValueClass(Text.class);
         job.setOutputKeyClass(IntWritable.class);
         job.setOutputValueClass(Text.class);
         FileInputFormat.addInputPath(job, new Path(args[0]));
